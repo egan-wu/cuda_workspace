@@ -11,6 +11,9 @@ By comparing metrics changes between different algorithm to enhance understandin
    - QK matmul
      - `Q(seq_len, d_model)` @ `K_transpose(d_model, seq_len)`) = `S(seq_len, seq_len)`
      - using block-level shared memory
+   - Softmax
+     - `Score_max(seq_len)` = softmax_row_max(`S(seq_len, seq_len)`)
+     - `Weighted_score(seq_len, seq_len)`= softmax_row_norm(`Score_max(seq_len)`)
 
 ### Cuda Algorithm
 - The following vitualize Cuda algorithm to get more understanding of how to leverage CUDA parallelism better

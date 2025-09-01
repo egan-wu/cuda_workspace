@@ -1,17 +1,21 @@
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <iostream>
 #include <cmath>
 #include <random>
 #include <chrono>
+#include <iomanip>
 
 #define SEQ_LEN 512
 #define D_MODEL 4096
-#define BM  64
-#define BN  64
-#define BK  16
+#define BM      64
+#define BN      64
+#define BK      16
+#define TILE    64
 
-#define PRINT_EN 0
+#define PRINT_EN   0
+#define ALIGN_SIZE 12
 
 // *** General function ***
 const std::string RESET = "\033[0m";
@@ -28,30 +32,21 @@ void init_random(float* arr, int size, float low = -1.0f, float high = 1.0f, uns
 }
 
 bool isclose(const float* a, const float* b, int size, float rtol = 1e-3f, float atol = 1e-5f) {
-    std::cout << BOLD << "Comparing CPU result & GPU result..." << RESET << std::endl;
-    bool fail = false;
     for (int i = 0; i < size; i++) {
         float diff = std::fabs(a[i] - b[i]);
         float tol  = atol + rtol * std::fabs(b[i]);
         if (diff > tol) {
-            std::cerr << "Mismatch at index " << i 
+            std::cerr << RED << "fail" << RESET << " "
+                      << "Mismatch at index " << i 
                       << " |a=" << a[i] 
                       << " b=" << b[i] 
                       << " diff=" << diff 
                       << " tol=" << tol << std::endl;
-            fail = true;
-            break;
+            return false;
         }
     }
 
-    std::cout << "is_close: ";
-    if (fail) {
-        std::cout << RED << "false" << RESET << std::endl;
-    }
-    else {
-        std::cout << GREEN << "true" << RESET << std::endl;
-    }
-    
+    std::cout << GREEN << "pass" << RESET << std::endl;
     return true;
 }
 
@@ -66,6 +61,7 @@ double measure_cpu_time(Func f) {
 
 // *** GPU related calculation ***
 
+extern "C"
 __global__ void qk_matmul 
 (
     const float* __restrict__ Q, // Query matrix, shape=(N, d)
@@ -148,6 +144,72 @@ __global__ void qk_matmul
     }
 }
 
+extern "C"
+__global__ void softmax_row_max_kernel
+(
+    const float* __restrict__ score, 
+    float* __restrict__ row_max, 
+    int N
+)
+{
+    // Each thread find max value of a row
+    int ridx = blockIdx.x;
+    if (ridx >= N) return;
+
+    int tidx = threadIdx.x;
+    float m = FLT_MIN;
+    for (int j = tidx; j < N; j+=blockDim.x) {
+        float v = score[(size_t)ridx * N + j];
+        if (v > m) { m = v;}
+    }
+
+    __shared__ float smax;
+    if (tidx == 0) {
+        smax = FLT_MIN;
+    }
+    __syncthreads();
+
+    atomicMax((int*)&smax, __float_as_int(m));
+    __syncthreads();
+    if (tidx == 0) {
+        row_max[ridx] = smax;
+    }
+}
+
+extern "C"
+__global__ void softmax_row_norm_kernel
+(
+    float* __restrict__ score, 
+    const float* __restrict__ row_max, 
+    int N
+)
+{
+    int ridx = blockIdx.x;
+    if (ridx >= N) { return; }
+    int tidx = threadIdx.x;
+    float maxVal = row_max[ridx];
+    float sumVal = 0.0f;
+    for (int j = tidx; j < N; j+=blockDim.x) {
+        float exp = expf(score[(size_t)ridx * N + j] - maxVal);
+        score[(size_t)ridx * N + j] = exp;
+        sumVal += exp;
+    }
+
+    __shared__ float smem_sum;
+    if (tidx == 0) {
+        smem_sum = 0.0f;
+    }
+    __syncthreads();
+
+    atomicAdd(&smem_sum, sumVal);
+    __syncthreads();
+
+    float divVal = smem_sum;
+    for (int j = tidx; j < N; j+=blockDim.x) {
+        score[(size_t)ridx * N + j] = score[(size_t)ridx * N + j] / divVal;
+    }
+}
+
 // *** CPU related calculation ***
 
 void matmul
@@ -175,7 +237,8 @@ void cpu_qk_matmul
     const float* __restrict__ K, 
     float* __restrict__ S, 
     int N, 
-    int d
+    int d,
+    float scale
 ) 
 {
     for (int i = 0; i < N; i++) {
@@ -184,8 +247,36 @@ void cpu_qk_matmul
             for (int k = 0; k < d; k++) {
                 acc += Q[i * d + k] * K[j * d + k];
             }
-            S[i * N + j] = acc;
+            S[i * N + j] = acc * scale;
         }
+    }
+}
+
+void cpu_softmax
+(
+    const float* __restrict__ S,
+    float* __restrict__ S_weight,
+    int N, 
+    int d    
+)
+{
+    for (int i = 0; i < N; i++) {
+        // safe softmax, avoid overflow
+        float max_val = S[i * d];
+        for (int j = 1; j < d; j++) {
+            max_val = std::max(max_val, S[i * d + j]);
+        }
+
+        float sum = 0.0f;
+        for (int j = 0; j < d; j++) {
+            S_weight[i * d + j] = std::exp(S[i * d + j] - max_val);
+            sum += S_weight[i * d + j];
+        }
+
+        for (int j = 0; j < d; j++) {
+            S_weight[i * d + j] /= sum;
+        }
+
     }
 }
 
@@ -193,22 +284,30 @@ int main() {
 
     // *** configuration
     std::cout << BOLD << "Configuration" << RESET << std::endl;
-    std::cout << "Q: (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
-    std::cout << "K: (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
-    std::cout << "S: (" << SEQ_LEN << ", " << SEQ_LEN << ")" << std::endl;
+    std::cout << "Q:    (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
+    std::cout << "K:    (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
+    std::cout << "V:    (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
+    std::cout << "S:    (" << SEQ_LEN << ", " << SEQ_LEN << ")" << std::endl;
+    std::cout << "Out:  (" << SEQ_LEN << ", " << D_MODEL << ")" << std::endl;
     std::cout << "Tile: (" << BM << ", " << BN << ")" << std::endl;
     std::cout << std::endl;
 
     // *** init device data
     float* host_Q = new float[SEQ_LEN * D_MODEL];
     float* host_K = new float[SEQ_LEN * D_MODEL];
+    float* host_V = new float[SEQ_LEN * D_MODEL];
+    float* host_Out = new float[SEQ_LEN * D_MODEL];
     float* host_cal_S = new float[SEQ_LEN * SEQ_LEN];
+    float* host_cal_softmax = new float[SEQ_LEN * SEQ_LEN];
+    float scale = 1.0f / std::sqrt((float)D_MODEL);
     int Q_element_size = SEQ_LEN * D_MODEL;
     int K_element_size = SEQ_LEN * D_MODEL;
+    int V_element_size = SEQ_LEN * D_MODEL;
     int S_element_size = SEQ_LEN * SEQ_LEN;
 
     init_random(host_Q, Q_element_size, -1.0f, 1.0f);
     init_random(host_K, K_element_size, -1.0f, 1.0f);
+    init_random(host_V, V_element_size, -1.0f, 1.0f);
 
     for (int i = 0; i < SEQ_LEN; i++) {
         for (int j = 0; j < SEQ_LEN; j++) {
@@ -219,15 +318,20 @@ int main() {
     // *** CPU calculate
     std::cout << BOLD << "CPU starts calculating attention layer..." << RESET << std::endl;
     double cpu_exe_time = measure_cpu_time([&]() {
-        cpu_qk_matmul(host_Q, host_K, host_cal_S, SEQ_LEN, D_MODEL);
+        cpu_qk_matmul(host_Q, host_K, host_cal_S, SEQ_LEN, D_MODEL, scale);
     });
-    std::cout << "CPU finished in " << GREEN << cpu_exe_time << RESET << " ms\n";
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "QK matmul " << "| " << GREEN << cpu_exe_time << RESET << " ms\n";
+
+    cpu_exe_time = measure_cpu_time([&]() {
+        cpu_softmax(host_cal_S, host_cal_softmax, SEQ_LEN, SEQ_LEN);
+    });
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax " << "| " << GREEN << cpu_exe_time << RESET << " ms\n";
 
 #if (PRINT_EN == 1)
     for (int i = 0; i < 10; i++) {
         std::cout << "[Row" << i << "]: ";
         for (int j = 0; j < 10; j++) {
-            std::cout << host_cal_S[i * SEQ_LEN + j] << " ";
+            std::cout << host_cal_softmax[i * SEQ_LEN + j] << " ";
         }
         std::cout << "..." << std::endl;
     }
@@ -244,6 +348,7 @@ int main() {
             dev_cal_S[i * SEQ_LEN + j] = 0.0f;
         }
     }
+    float* dev_cal_softmax = new float[SEQ_LEN * SEQ_LEN];
 
     // --- cuda event
     cudaEvent_t start_time, end_time;
@@ -253,29 +358,54 @@ int main() {
     // --- move host data to device
     float* dev_Q;
     float* dev_K;
+    float* dev_V;
     float* dev_S;
+    float* dev_Out;
+    float* dev_Smax;
     int Q_total_bytes = SEQ_LEN * D_MODEL * sizeof(float);
     int K_total_bytes = SEQ_LEN * D_MODEL * sizeof(float);
+    int V_total_bytes = SEQ_LEN * D_MODEL * sizeof(float);
+    int Out_total_bytes = SEQ_LEN * D_MODEL * sizeof(float);
     int S_total_bytes = SEQ_LEN * SEQ_LEN * sizeof(float);
+    int Smax_total_bytes = SEQ_LEN * sizeof(float);
     cudaMalloc(&dev_Q, Q_total_bytes);
     cudaMalloc(&dev_K, K_total_bytes);
+    cudaMalloc(&dev_V, V_total_bytes);
     cudaMalloc(&dev_S, S_total_bytes);
+    cudaMalloc(&dev_Out, Out_total_bytes);
+    cudaMalloc(&dev_Smax, Smax_total_bytes);
     cudaMemcpy(dev_Q, host_Q, Q_total_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(dev_K, host_K, K_total_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_V, host_V, V_total_bytes, cudaMemcpyHostToDevice);
 
     dim3 kernelBlock(256); // 16 * 16
     dim3 kernelGrid((SEQ_LEN + BN - 1) / BN, (SEQ_LEN + BM - 1) / BM);
     size_t smem_byte_size = (BM * BK + BK * BN) * sizeof(float);
 
+    // *************
+    // * QK Matmul *
+    // *************
     cudaEventRecord(start_time);
-    qk_matmul<<<kernelGrid, kernelBlock, smem_byte_size>>>(dev_Q, dev_K, dev_S, SEQ_LEN, D_MODEL, 1.0f);
+    qk_matmul<<<kernelGrid, kernelBlock, smem_byte_size>>>(dev_Q, dev_K, dev_S, SEQ_LEN, D_MODEL, scale);
     cudaEventRecord(end_time);
     cudaEventSynchronize(end_time);
     float gpu_exec_time = 0;
     cudaEventElapsedTime(&gpu_exec_time, start_time, end_time);
-    std::cout << "GPU kernel finished in " << GREEN << gpu_exec_time << RESET << " ms\n";
-
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "QK matmul " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
     cudaMemcpy(dev_cal_S, dev_S, S_total_bytes, cudaMemcpyDeviceToHost);
+
+    // ***********
+    // * Softmax *
+    // ***********
+    cudaEventRecord(start_time);
+    softmax_row_max_kernel<<<SEQ_LEN, 256>>>(dev_S, dev_Smax, SEQ_LEN);
+    softmax_row_norm_kernel<<<SEQ_LEN, 256>>>(dev_S, dev_Smax, SEQ_LEN);
+    cudaEventRecord(end_time);
+    cudaEventSynchronize(end_time);
+    gpu_exec_time = 0;
+    cudaEventElapsedTime(&gpu_exec_time, start_time, end_time);
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
+    cudaMemcpy(dev_cal_softmax, dev_S, S_total_bytes, cudaMemcpyDeviceToHost);
 
 #if (PRINT_EN == 1)
     for (int i = 0; i < 10; i++) {
@@ -288,7 +418,11 @@ int main() {
 #endif
 
     std::cout << std::endl;
+    std::cout << BOLD << "Comparing CPU result & GPU result..." << RESET << std::endl;
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "QK matmul" << "| ";
     isclose(host_cal_S, dev_cal_S, S_element_size);
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax" << "| ";
+    isclose(host_cal_softmax, dev_cal_softmax, S_element_size);
 
     cudaFree(dev_Q);
     cudaFree(dev_K);

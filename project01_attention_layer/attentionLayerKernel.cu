@@ -15,7 +15,7 @@
 #define TILE    64
 
 #define PRINT_EN   0
-#define ALIGN_SIZE 12
+#define ALIGN_SIZE 16
 
 #define RNUP(x, y) ((x + y - 1)/y)
 
@@ -62,6 +62,20 @@ double measure_cpu_time(Func f) {
 }
 
 // *** GPU related calculation ***
+extern "C"
+__global__ void flash_attention
+(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    int N, // seq_len
+    int D, // d_model
+    float scale
+)
+{
+
+}
+
 #define GEMM_TILE 16
 #define NAIVE_MODE_EN      (1)
 #define SHARED_MEM_MODE_EN (1)
@@ -239,7 +253,7 @@ __global__ void softmax_row_max_kernel
 
     __shared__ float smax;
     if (tidx == 0) {
-        smax = FLT_MIN;
+        smax = -FLT_MAX;
     }
     __syncthreads();
 
@@ -281,6 +295,35 @@ __global__ void softmax_row_norm_kernel
     float divVal = smem_sum;
     for (int j = tidx; j < N; j+=blockDim.x) {
         score[(size_t)ridx * N + j] = score[(size_t)ridx * N + j] / divVal;
+    }
+}
+
+extern "C"
+/**
+ * a row-major online softmax kernel 
+ */ 
+__global__ void online_softmax
+(
+    float* __restrict__ score, // (N, M)
+    int N,
+    int M  
+)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < N) {
+        float sum = 0.0f;
+        float old_max = -FLT_MAX;
+        for (int col = 0; col < M; col++) {
+            float val = score[row * M + col];
+            float new_max = (old_max > val) ? old_max : val;
+            sum = sum * expf(old_max - new_max) + expf(val - new_max);
+            old_max = new_max;
+        }
+
+        for (int col = 0; col < M; col++) {
+            score[row * M + col] = expf(score[row * M + col] - old_max) / sum;
+        }
     }
 }
 
@@ -352,7 +395,7 @@ void cpu_softmax
     const float* __restrict__ S,
     float* __restrict__ S_weight,
     int N, 
-    int d    
+    int d
 )
 {
     for (int i = 0; i < N; i++) {
@@ -499,6 +542,8 @@ int main() {
     // ***********
     // * Softmax *
     // ***********
+
+#if (0) // normal softmax
     cudaEventRecord(start_time);
     softmax_row_max_kernel<<<SEQ_LEN, 256>>>(dev_S, dev_Smax, SEQ_LEN);
     softmax_row_norm_kernel<<<SEQ_LEN, 256>>>(dev_S, dev_Smax, SEQ_LEN);
@@ -508,7 +553,18 @@ int main() {
     cudaEventElapsedTime(&gpu_exec_time, start_time, end_time);
     std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
     cudaMemcpy(dev_cal_softmax, dev_S, S_total_bytes, cudaMemcpyDeviceToHost);
-
+#else // online softmax
+    cudaEventRecord(start_time);
+    int threadPerBlock = 256;
+    int blockPerGrid = RNUP(SEQ_LEN, threadPerBlock);
+    online_softmax<<<blockPerGrid, threadPerBlock>>>(dev_S, SEQ_LEN, SEQ_LEN);
+    cudaEventRecord(end_time);
+    cudaEventSynchronize(end_time);
+    gpu_exec_time = 0;
+    cudaEventElapsedTime(&gpu_exec_time, start_time, end_time);
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "Online Softmax " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
+    cudaMemcpy(dev_cal_softmax, dev_S, S_total_bytes, cudaMemcpyDeviceToHost);
+#endif
 
     // *************
     // * SV matmul *

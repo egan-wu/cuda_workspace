@@ -17,6 +17,8 @@
 #define PRINT_EN   0
 #define ALIGN_SIZE 12
 
+#define RNUP(x, y) ((x + y - 1)/y)
+
 // *** General function ***
 const std::string RESET = "\033[0m";
 const std::string GREEN = "\033[32m";
@@ -60,6 +62,78 @@ double measure_cpu_time(Func f) {
 }
 
 // *** GPU related calculation ***
+#define GEMM_TILE 16
+#define NAIVE_MODE_EN      (1)
+#define SHARED_MEM_MODE_EN (1)
+extern "C"
+__global__ void gemm_kernel
+(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K,
+    float bias
+)
+{
+
+#if (NAIVE_MODE_EN == 1)
+    /* Most simple and naive gemm */
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float val = 0.0f;
+        for (int k = 0; k < K; k++) {
+            val += A[row * K + k] * B[k * N + col];
+        }
+
+        C[row * N + col] = val + bias;
+    }
+
+#else // if (SHARED_MEM_MODE_EN == 1)
+    __shared__ float smemA[GEMM_TILE][GEMM_TILE];
+    __shared__ float smemB[GEMM_TILE][GEMM_TILE];
+
+    int row = blockIdx.y * GEMM_TILE + threadIdx.y;
+    int col = blockIdx.x * GEMM_TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < RNUP(K, GEMM_TILE); t++) {
+        int k;
+        
+        // load data A into shared memory
+        k = t * GEMM_TILE + threadIdx.x;
+        if (row < M && k < K) {
+            smemA[threadIdx.y][threadIdx.x] = A[row * K + k];
+        } else {
+            smemA[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // load data B into shared memory
+        k = t * GEMM_TILE + threadIdx.y;
+        if (col < N && k < K) {
+            smemB[threadIdx.y][threadIdx.x] = B[k * N + col];
+        } else {
+            smemB[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads(); // make sure data are all moved into shared memory
+
+        for (k = 0; k < GEMM_TILE; k++) {
+            acc += smemA[threadIdx.y][k] * smemB[k][threadIdx.x];
+        }
+
+        __syncthreads(); // make sure all threads finish calculating
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc + bias;
+    }
+#endif
+}
 
 extern "C"
 __global__ void qk_matmul 
@@ -252,6 +326,27 @@ void cpu_qk_matmul
     }
 }
 
+void cpu_gemm
+(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int N,
+    int K
+)
+{
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; k++) {
+                acc += A[m * K + k] * B[k * N + n];
+            }
+            C[m * N + n] = acc;
+        }
+    }
+}
+
 void cpu_softmax
 (
     const float* __restrict__ S,
@@ -299,6 +394,7 @@ int main() {
     float* host_Out = new float[SEQ_LEN * D_MODEL];
     float* host_cal_S = new float[SEQ_LEN * SEQ_LEN];
     float* host_cal_softmax = new float[SEQ_LEN * SEQ_LEN];
+    float* host_cal_weight_score = new float[SEQ_LEN * D_MODEL];
     float scale = 1.0f / std::sqrt((float)D_MODEL);
     int Q_element_size = SEQ_LEN * D_MODEL;
     int K_element_size = SEQ_LEN * D_MODEL;
@@ -327,6 +423,11 @@ int main() {
     });
     std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax " << "| " << GREEN << cpu_exe_time << RESET << " ms\n";
 
+    cpu_exe_time = measure_cpu_time([&]() {
+        cpu_gemm(host_cal_softmax, host_V, host_cal_weight_score, SEQ_LEN, D_MODEL, SEQ_LEN);
+    });
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "SV matmul " << "| " << GREEN << cpu_exe_time << RESET << " ms\n";
+
 #if (PRINT_EN == 1)
     for (int i = 0; i < 10; i++) {
         std::cout << "[Row" << i << "]: ";
@@ -349,6 +450,7 @@ int main() {
         }
     }
     float* dev_cal_softmax = new float[SEQ_LEN * SEQ_LEN];
+    float* dev_cal_out = new float[SEQ_LEN * D_MODEL];
 
     // --- cuda event
     cudaEvent_t start_time, end_time;
@@ -407,6 +509,21 @@ int main() {
     std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
     cudaMemcpy(dev_cal_softmax, dev_S, S_total_bytes, cudaMemcpyDeviceToHost);
 
+
+    // *************
+    // * SV matmul *
+    // *************
+    dim3 threadsPerBlock_gemm(GEMM_TILE, GEMM_TILE);
+    dim3 blocksPerGrid_gemm(RNUP(D_MODEL, GEMM_TILE), RNUP(SEQ_LEN, GEMM_TILE));
+    cudaEventRecord(start_time);
+    gemm_kernel<<<blocksPerGrid_gemm, threadsPerBlock_gemm>>>(dev_S, dev_V, dev_Out, SEQ_LEN, D_MODEL, SEQ_LEN, 0.0f);
+    cudaEventRecord(end_time);
+    cudaEventSynchronize(end_time);
+    gpu_exec_time = 0;
+    cudaEventElapsedTime(&gpu_exec_time, start_time, end_time);
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "SV matmul " << "| " << GREEN << gpu_exec_time << RESET << " ms\n";
+    cudaMemcpy(dev_cal_out, dev_Out, Out_total_bytes, cudaMemcpyDeviceToHost);
+    
 #if (PRINT_EN == 1)
     for (int i = 0; i < 10; i++) {
         std::cout << "[Row" << i << "]: ";
@@ -423,6 +540,8 @@ int main() {
     isclose(host_cal_S, dev_cal_S, S_element_size);
     std::cout << std::left << std::setw(ALIGN_SIZE) << "Softmax" << "| ";
     isclose(host_cal_softmax, dev_cal_softmax, S_element_size);
+    std::cout << std::left << std::setw(ALIGN_SIZE) << "SV matmul" << "| ";
+    isclose(host_cal_weight_score, dev_cal_out, V_element_size);
 
     cudaFree(dev_Q);
     cudaFree(dev_K);
